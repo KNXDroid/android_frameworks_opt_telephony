@@ -3559,6 +3559,8 @@ public class ServiceStateTracker extends Handler {
     }
 
     private void pollStateDone() {
+        checkAndKickFrom2G(mNewSS);
+
         if (!mPhone.isPhoneTypeGsm()) {
             updateRoamingState();
         }
@@ -6085,5 +6087,69 @@ public class ServiceStateTracker extends Handler {
             return imsPhone.getImsRegistrationTech();
         }
         return ImsRegistrationImplBase.REGISTRATION_TECH_NONE;
+    }
+
+    private boolean mIsEscaping2G = false;
+    private long mOriginalAllowedNetworkTypes = -1;
+    private Runnable mRestoreRunnable = null;
+
+    private void checkAndKickFrom2G(ServiceState serviceState) {
+        if (serviceState == null) return;
+        int networkType = serviceState.getDataNetworkType();
+
+        if (mIsEscaping2G && (
+                networkType == TelephonyManager.NETWORK_TYPE_LTE ||
+                networkType == TelephonyManager.NETWORK_TYPE_NR ||
+                networkType == TelephonyManager.NETWORK_TYPE_UMTS ||
+                networkType == TelephonyManager.NETWORK_TYPE_HSPAP ||
+                networkType == TelephonyManager.NETWORK_TYPE_HSDPA ||
+                networkType == TelephonyManager.NETWORK_TYPE_HSUPA ||
+                networkType == TelephonyManager.NETWORK_TYPE_HSPA)) {
+
+            log("Anti-2G: Success! Upgraded to better network. Restoring 2G support as backup.");
+            restore2GConfig();
+            return;
+        }
+
+        boolean isDataEnabled = mPhone.getDataSettingsManager().isDataEnabled();
+        boolean is2G = (networkType == TelephonyManager.NETWORK_TYPE_GSM ||
+                        networkType == TelephonyManager.NETWORK_TYPE_EDGE ||
+                        networkType == TelephonyManager.NETWORK_TYPE_GPRS ||
+                        networkType == TelephonyManager.NETWORK_TYPE_1xRTT ||
+                        networkType == TelephonyManager.NETWORK_TYPE_CDMA);
+
+        if (is2G && isDataEnabled && !mIsEscaping2G) {
+            log("Anti-2G: Stuck on 2G with Data ON. Kicking modem...");
+
+            mOriginalAllowedNetworkTypes = mPhone.getAllowedNetworkTypes(TelephonyManager.ALLOWED_NETWORK_TYPES_REASON_USER);
+
+            long targetAllowed = mOriginalAllowedNetworkTypes
+                    & ~TelephonyManager.NETWORK_TYPE_BITMASK_GSM
+                    & ~TelephonyManager.NETWORK_TYPE_BITMASK_CDMA;
+
+            mPhone.setAllowedNetworkTypes(TelephonyManager.ALLOWED_NETWORK_TYPES_REASON_USER, targetAllowed, null);
+            mIsEscaping2G = true;
+
+            if (mRestoreRunnable != null) removeCallbacks(mRestoreRunnable);
+
+            mRestoreRunnable = () -> {
+                if (mIsEscaping2G) {
+                    log("Anti-2G: Timeout. Could not find better network. Restoring 2G.");
+                    restore2GConfig();
+                }
+            };
+            postDelayed(mRestoreRunnable, 20000);
+        }
+    }
+
+    private void restore2GConfig() {
+        if (!mIsEscaping2G) return;
+
+        if (mOriginalAllowedNetworkTypes != -1) {
+            mPhone.setAllowedNetworkTypes(TelephonyManager.ALLOWED_NETWORK_TYPES_REASON_USER, mOriginalAllowedNetworkTypes, null);
+        }
+
+        mIsEscaping2G = false;
+        if (mRestoreRunnable != null) removeCallbacks(mRestoreRunnable);
     }
 }
