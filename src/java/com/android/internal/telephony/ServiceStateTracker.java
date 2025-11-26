@@ -6097,6 +6097,7 @@ public class ServiceStateTracker extends Handler {
         if (serviceState == null) return;
         int networkType = serviceState.getDataNetworkType();
 
+        // Check if we already succeeded in escaping
         if (mIsEscaping2G && (
                 networkType == TelephonyManager.NETWORK_TYPE_LTE ||
                 networkType == TelephonyManager.NETWORK_TYPE_NR ||
@@ -6111,15 +6112,37 @@ public class ServiceStateTracker extends Handler {
             return;
         }
 
-        boolean isDataEnabled = mPhone.getDataSettingsManager().isDataEnabled();
+        // 1. Check if the User Switch for Data is ON
+        boolean isDataEnabledSetting = mPhone.getDataSettingsManager().isDataEnabled();
+
+        // 2. Check if we are physically camped on a 2G network
         boolean is2G = (networkType == TelephonyManager.NETWORK_TYPE_GSM ||
                         networkType == TelephonyManager.NETWORK_TYPE_EDGE ||
                         networkType == TelephonyManager.NETWORK_TYPE_GPRS ||
                         networkType == TelephonyManager.NETWORK_TYPE_1xRTT ||
                         networkType == TelephonyManager.NETWORK_TYPE_CDMA);
 
-        if (is2G && isDataEnabled && !mIsEscaping2G) {
-            log("Anti-2G: Stuck on 2G with Data ON. Kicking modem...");
+        // 3. NEW: Check if Mobile Data is actually the ACTIVE internet connection
+        // (This prevents kicking if the user is on 2G but using Wi-Fi)
+        boolean isMobileDataActive = false;
+        android.content.Context context = mPhone.getContext();
+        android.net.ConnectivityManager cm = (android.net.ConnectivityManager) context.getSystemService(android.content.Context.CONNECTIVITY_SERVICE);
+
+        if (cm != null) {
+            android.net.Network activeNetwork = cm.getActiveNetwork();
+            if (activeNetwork != null) {
+                android.net.NetworkCapabilities caps = cm.getNetworkCapabilities(activeNetwork);
+                if (caps != null
+                    && caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_CELLULAR)
+                    && caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET)) {
+                    isMobileDataActive = true;
+                }
+            }
+        }
+
+        // Modified Condition: Added '&& isMobileDataActive'
+        if (is2G && isDataEnabledSetting && isMobileDataActive && !mIsEscaping2G) {
+            log("Anti-2G: Stuck on 2G with Active Cellular Data. Kicking modem...");
 
             mOriginalAllowedNetworkTypes = mPhone.getAllowedNetworkTypes(TelephonyManager.ALLOWED_NETWORK_TYPES_REASON_USER);
 
