@@ -91,6 +91,9 @@ import android.telephony.TelephonyManager;
 import android.telephony.UiccAccessRule;
 import android.telephony.UssdResponse;
 import android.telephony.ims.ImsCallProfile;
+import android.app.AlarmManager;
+import android.app.PendingIntent;
+import android.os.SystemClock;
 import android.text.TextUtils;
 import android.util.ArraySet;
 import android.util.Log;
@@ -433,6 +436,7 @@ public class GsmCdmaPhone extends Phone {
                 new HandlerExecutor(this), mSubscriptionsChangedListener);
 
         logd("GsmCdmaPhone: constructor: sub = " + mPhoneId);
+        initDataPulseLogic();
     }
 
     private BroadcastReceiver mBroadcastReceiver = new BroadcastReceiver() {
@@ -5498,5 +5502,136 @@ public class GsmCdmaPhone extends Phone {
     @Nullable
     public SmsDispatchersController getSmsDispatchersController() {
         return mIccSmsInterfaceManager.mDispatchersController;
+    }
+
+    private static final int DELAY_BEFORE_START_MS = 5 * 60 * 1000;
+    private static final int PULSE_OFF_DURATION_MS = 20 * 60 * 1000;
+    private static final int PULSE_ON_DURATION_MS  = 1 * 60 * 1000;
+
+    private static final String ACTION_PULSE_START_DELAYED = "com.android.phone.PULSE_START_DELAYED";
+    private static final String ACTION_PULSE_CYCLE_STEP    = "com.android.phone.PULSE_CYCLE_STEP";
+    private static final String SETTING_KEY_DATA_PULSE = "data_pulse_enabled_custom";
+
+    private PendingIntent mPulseStartIntent = null;
+    private PendingIntent mPulseCycleIntent = null;
+    private boolean mIsPulseActive = false;
+    private boolean mDataIsCurrentlyForcedOff = false;
+
+    private final BroadcastReceiver mPulseReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            String action = intent.getAction();
+
+            if (Intent.ACTION_SCREEN_OFF.equals(action)) {
+                scheduleStartDelay();
+            }
+            else if (Intent.ACTION_SCREEN_ON.equals(action)) {
+                stopPulseModeAndRestore();
+            }
+            else if (ACTION_PULSE_START_DELAYED.equals(action)) {
+                checkSettingsAndStartPulse();
+            }
+            else if (ACTION_PULSE_CYCLE_STEP.equals(action)) {
+                handlePulseCycleStep();
+            }
+        }
+    };
+
+    private void initDataPulseLogic() {
+        IntentFilter filter = new IntentFilter();
+        filter.addAction(Intent.ACTION_SCREEN_OFF);
+        filter.addAction(Intent.ACTION_SCREEN_ON);
+        filter.addAction(ACTION_PULSE_START_DELAYED);
+        filter.addAction(ACTION_PULSE_CYCLE_STEP);
+        getContext().registerReceiver(mPulseReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
+    }
+
+    private void scheduleStartDelay() {
+        if (!isPulseSettingEnabled()) return;
+
+        logd("Pulse: Screen OFF. Scheduling start in 5 mins...");
+        AlarmManager am = (AlarmManager) getContext().getSystemService(Context.ALARM_SERVICE);
+
+        Intent intent = new Intent(ACTION_PULSE_START_DELAYED);
+        mPulseStartIntent = PendingIntent.getBroadcast(getContext(), 0, intent,
+                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+
+        long triggerAt = SystemClock.elapsedRealtime() + DELAY_BEFORE_START_MS;
+        if (am != null) am.setExactAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP, triggerAt, mPulseStartIntent);
+    }
+
+    private void checkSettingsAndStartPulse() {
+        if (!isPulseSettingEnabled()) {
+            logd("Pulse: Timer fired, but setting is OFF.");
+            return;
+        }
+
+        logd("Pulse: Starting Pulse Mode (OFF for 20m).");
+        mIsPulseActive = true;
+
+        // Выключаем данные
+        setInternalDataState(false);
+        scheduleNextCycleStep(PULSE_OFF_DURATION_MS);
+    }
+
+    private void handlePulseCycleStep() {
+        if (!mIsPulseActive) return;
+
+        if (mDataIsCurrentlyForcedOff) {
+            logd("Pulse: Waking up! Enabling data for 1 min.");
+            setInternalDataState(true);
+            scheduleNextCycleStep(PULSE_ON_DURATION_MS);
+        } else {
+            logd("Pulse: Sleeping. Disabling data for 20 mins.");
+            setInternalDataState(false);
+            scheduleNextCycleStep(PULSE_OFF_DURATION_MS);
+        }
+    }
+
+    private void scheduleNextCycleStep(long delayMs) {
+        AlarmManager am = (AlarmManager) getContext().getSystemService(Context.ALARM_SERVICE);
+        Intent intent = new Intent(ACTION_PULSE_CYCLE_STEP);
+        mPulseCycleIntent = PendingIntent.getBroadcast(getContext(), 0, intent,
+                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+
+        long triggerAt = SystemClock.elapsedRealtime() + delayMs;
+        if (am != null) am.setExactAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP, triggerAt, mPulseCycleIntent);
+    }
+
+    private void stopPulseModeAndRestore() {
+        logd("Pulse: Screen ON. Restoring Data.");
+        mIsPulseActive = false;
+
+        AlarmManager am = (AlarmManager) getContext().getSystemService(Context.ALARM_SERVICE);
+        if (am != null) {
+            if (mPulseStartIntent != null) am.cancel(mPulseStartIntent);
+            if (mPulseCycleIntent != null) am.cancel(mPulseCycleIntent);
+        }
+
+        setInternalDataState(true);
+    }
+
+    private boolean isPulseSettingEnabled() {
+        return Settings.Global.getInt(getContext().getContentResolver(), SETTING_KEY_DATA_PULSE, 0) == 1;
+    }
+
+    private void setInternalDataState(boolean enable) {
+        mDataIsCurrentlyForcedOff = !enable;
+
+        // Получаем менеджер настроек данных
+        if (getDataSettingsManager() != null) {
+            // 1. Исправляем чтение статуса: вызываем isDataEnabled() у менеджера, а не у телефона
+            boolean currentStatus = getDataSettingsManager().isDataEnabled();
+
+            if (currentStatus != enable) {
+                // 2. Исправляем запись: добавляем третий аргумент (имя пакета)
+                // Мы используем getContext().getOpPackageName(), чтобы передать имя текущего пакета (com.android.phone)
+                getDataSettingsManager().setDataEnabled(
+                    TelephonyManager.DATA_ENABLED_REASON_THERMAL,
+                    enable,
+                    getContext().getOpPackageName()
+                );
+            }
+        }
     }
 }
